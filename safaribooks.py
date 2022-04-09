@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # coding: utf-8
+from operator import truediv
 import re
 import os
 import sys
@@ -16,9 +17,10 @@ from random import random
 from lxml import html, etree
 from multiprocessing import Process, Queue, Value
 from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
+import boto3
+from botocore.exceptions import ClientError
 
-
-PATH = os.path.dirname(os.path.realpath(__file__))
+PATH = "/tmp"
 COOKIES_FILE = os.path.join(PATH, "cookies.json")
 
 ORLY_BASE_HOST = "oreilly.com"  # PLEASE INSERT URL HERE
@@ -54,7 +56,7 @@ class Display:
 
         self.logger = logging.getLogger("SafariBooks")
         self.logger.setLevel(logging.INFO)
-        logs_handler = logging.FileHandler(filename=self.log_file)
+        logs_handler = logging.StreamHandler(sys.stdout)
         logs_handler.setFormatter(self.BASE_FORMAT)
         logs_handler.setLevel(logging.INFO)
         self.logger.addHandler(logs_handler)
@@ -64,12 +66,12 @@ class Display:
         self.logger.info("** Welcome to SafariBooks! **")
 
         self.book_ad_info = False
-        self.css_ad_info = Value("i", 0)
-        self.images_ad_info = Value("i", 0)
+        self.css_ad_info = 0
+        self.images_ad_info = 0
         self.last_request = (None,)
         self.in_error = False
 
-        self.state_status = Value("i", 0)
+        self.state_status = 0
         sys.excepthook = self.unhandled_exception
 
     def set_output_dir(self, output_dir):
@@ -184,8 +186,8 @@ class Display:
     def state(self, origin, done):
         progress = int(done * 100 / origin)
         bar = int(progress * (self.columns - 11) / 100)
-        if self.state_status.value < progress:
-            self.state_status.value = progress
+        if self.state_status < progress:
+            self.state_status = progress
             sys.stdout.write(
                 "\r    " + self.SH_BG_YELLOW + "[" + ("#" * bar).ljust(self.columns - 11, "-") + "]" +
                 self.SH_DEFAULT + ("%4s" % progress) + "%" + ("\n" if progress == 100 else "")
@@ -311,7 +313,7 @@ class SafariBooks:
 
     def __init__(self, args):
         self.args = args
-        self.display = Display("info_%s.log" % escape(args.bookid))
+        self.display = Display("info_%s.log" % escape(args["bookid"]))
         self.display.intro()
 
         self.session = requests.Session()
@@ -323,7 +325,7 @@ class SafariBooks:
 
         self.jwt = {}
 
-        if not args.cred:
+        if not args["cred"]:
             if not os.path.isfile(COOKIES_FILE):
                 self.display.exit("Login: unable to find `cookies.json` file.\n"
                                   "    Please use the `--cred` or `--login` options to perform the login.")
@@ -332,13 +334,13 @@ class SafariBooks:
 
         else:
             self.display.info("Logging into Safari Books Online...", state=True)
-            self.do_login(*args.cred)
-            if not args.no_cookies:
+            self.do_login(*args["cred"])
+            if not args["no_cookies"]:
                 json.dump(self.session.cookies.get_dict(), open(COOKIES_FILE, 'w'))
 
         self.check_login()
 
-        self.book_id = args.bookid
+        self.book_id = args["bookid"]
         self.api_url = self.API_TEMPLATE.format(self.book_id)
 
         self.display.info("Retrieving book info...")
@@ -376,7 +378,7 @@ class SafariBooks:
         self.images = []
 
         self.display.info("Downloading book contents... (%s chapters)" % len(self.book_chapters), state=True)
-        self.BASE_HTML = self.BASE_01_HTML + (self.KINDLE_HTML if not args.kindle else "") + self.BASE_02_HTML
+        self.BASE_HTML = self.BASE_01_HTML + (self.KINDLE_HTML if not args["kindle"] else "") + self.BASE_02_HTML
 
         self.cover = False
         self.get()
@@ -394,24 +396,21 @@ class SafariBooks:
             self.filename = self.book_chapters[0]["filename"]
             self.save_page_html(cover_html)
 
-        self.css_done_queue = Queue(0) if "win" not in sys.platform else WinQueue()
+        self.css_done_queue = Queue(0) if "win" in sys.platform else WinQueue()
         self.display.info("Downloading book CSSs... (%s files)" % len(self.css), state=True)
         self.collect_css()
-        self.images_done_queue = Queue(0) if "win" not in sys.platform else WinQueue()
+        self.images_done_queue = Queue(0) if "win" in sys.platform else WinQueue()
         self.display.info("Downloading book images... (%s files)" % len(self.images), state=True)
         self.collect_images()
 
         self.display.info("Creating EPUB file...", state=True)
         self.create_epub()
 
-        if not args.no_cookies:
+        if not args["no_cookies"]:
             json.dump(self.session.cookies.get_dict(), open(COOKIES_FILE, "w"))
 
         self.display.done(os.path.join(self.BOOK_PATH, self.book_id + ".epub"))
         self.display.unregister()
-
-        if not self.display.in_error and not args.log:
-            os.remove(self.display.log_file)
 
     def handle_cookie_update(self, set_cookie_headers):
         for morsel in set_cookie_headers:
@@ -783,7 +782,7 @@ class SafariBooks:
 
         else:
             os.makedirs(self.css_path)
-            self.display.css_ad_info.value = 1
+            self.display.css_ad_info = 1
 
         self.images_path = os.path.join(oebps, "Images")
         if os.path.isdir(self.images_path):
@@ -791,13 +790,37 @@ class SafariBooks:
 
         else:
             os.makedirs(self.images_path)
-            self.display.images_ad_info.value = 1
+            self.display.images_ad_info = 1
 
     def save_page_html(self, contents):
         self.filename = self.filename.replace(".html", ".xhtml")
-        open(os.path.join(self.BOOK_PATH, "OEBPS", self.filename), "wb") \
+        filepath = os.path.join(self.BOOK_PATH, "OEBPS", self.filename)
+        open(filepath, "wb") \
             .write(self.BASE_HTML.format(contents[0], contents[1]).encode("utf-8", 'xmlcharrefreplace'))
         self.display.log("Created: %s" % self.filename)
+        self.upload_file(filepath, self.args["s3_bucket"])
+
+    def upload_file(self, file_name, bucket, object_name=None):
+        """Upload a file to an S3 bucket
+
+        :param file_name: File to upload
+        :param bucket: Bucket to upload to
+        :param object_name: S3 object name. If not specified then file_name is used
+        :return: True if file was uploaded, else False
+        """
+
+        # If S3 object_name was not specified, use file_name
+        if object_name is None:
+            object_name = os.path.basename(file_name)
+
+        # Upload the file
+        s3_client = boto3.client('s3')
+        try:
+            response = s3_client.upload_file(file_name, bucket, object_name)
+        except ClientError as e:
+            self.display.log(e)
+            return False
+        return True    
 
     def get(self):
         len_books = len(self.book_chapters)
@@ -853,13 +876,13 @@ class SafariBooks:
     def _thread_download_css(self, url):
         css_file = os.path.join(self.css_path, "Style{0:0>2}.css".format(self.css.index(url)))
         if os.path.isfile(css_file):
-            if not self.display.css_ad_info.value and url not in self.css[:self.css.index(url)]:
+            if not self.display.css_ad_info and url not in self.css[:self.css.index(url)]:
                 self.display.info(("File `%s` already exists.\n"
                                    "    If you want to download again all the CSSs,\n"
                                    "    please delete the output directory '" + self.BOOK_PATH + "'"
                                    " and restart the program.") %
                                   css_file)
-                self.display.css_ad_info.value = 1
+                self.display.css_ad_info = 1
 
         else:
             response = self.requests_provider(url)
@@ -877,13 +900,13 @@ class SafariBooks:
         image_name = url.split("/")[-1]
         image_path = os.path.join(self.images_path, image_name)
         if os.path.isfile(image_path):
-            if not self.display.images_ad_info.value and url not in self.images[:self.images.index(url)]:
+            if not self.display.images_ad_info and url not in self.images[:self.images.index(url)]:
                 self.display.info(("File `%s` already exists.\n"
                                    "    If you want to download again all the images,\n"
                                    "    please delete the output directory '" + self.BOOK_PATH + "'"
                                    " and restart the program.") %
                                   image_name)
-                self.display.images_ad_info.value = 1
+                self.display.images_ad_info = 1
 
         else:
             response = self.requests_provider(urljoin(SAFARI_BASE_URL, url), stream=True)
@@ -912,7 +935,7 @@ class SafariBooks:
                 proc.join()
 
     def collect_css(self):
-        self.display.state_status.value = -1
+        self.display.state_status = -1
 
         # "self._start_multiprocessing" seems to cause problem. Switching to mono-thread download.
         for css_url in self.css:
@@ -925,7 +948,7 @@ class SafariBooks:
                               "    please delete the output directory '" + self.BOOK_PATH +
                               "' and restart the program.")
 
-        self.display.state_status.value = -1
+        self.display.state_status = -1
 
         # "self._start_multiprocessing" seems to cause problem. Switching to mono-thread download.
         for image_url in self.images:
@@ -1051,74 +1074,19 @@ class SafariBooks:
             os.remove(zip_file + ".zip")
 
         shutil.make_archive(zip_file, 'zip', self.BOOK_PATH)
-        os.rename(zip_file + ".zip", os.path.join(self.BOOK_PATH, self.book_id) + ".epub")
+        filepath = os.path.join(self.BOOK_PATH, self.book_id) + ".epub"
+        os.rename(zip_file + ".zip", filepath)
+        self.upload_file(filepath, self.args["s3_bucket"])
 
 
 # MAIN
-if __name__ == "__main__":
-    arguments = argparse.ArgumentParser(prog="safaribooks.py",
-                                        description="Download and generate an EPUB of your favorite books"
-                                                    " from Safari Books Online.",
-                                        add_help=False,
-                                        allow_abbrev=False)
-
-    login_arg_group = arguments.add_mutually_exclusive_group()
-    login_arg_group.add_argument(
-        "--cred", metavar="<EMAIL:PASS>", default=False,
-        help="Credentials used to perform the auth login on Safari Books Online."
-             " Es. ` --cred \"account_mail@mail.com:password01\" `."
-    )
-    login_arg_group.add_argument(
-        "--login", action='store_true',
-        help="Prompt for credentials used to perform the auth login on Safari Books Online."
-    )
-
-    arguments.add_argument(
-        "--no-cookies", dest="no_cookies", action='store_true',
-        help="Prevent your session data to be saved into `cookies.json` file."
-    )
-    arguments.add_argument(
-        "--kindle", dest="kindle", action='store_true',
-        help="Add some CSS rules that block overflow on `table` and `pre` elements."
-             " Use this option if you're going to export the EPUB to E-Readers like Amazon Kindle."
-    )
-    arguments.add_argument(
-        "--preserve-log", dest="log", action='store_true', help="Leave the `info_XXXXXXXXXXXXX.log`"
-                                                                " file even if there isn't any error."
-    )
-    arguments.add_argument("--help", action="help", default=argparse.SUPPRESS, help='Show this help message.')
-    arguments.add_argument(
-        "bookid", metavar='<BOOK ID>',
-        help="Book digits ID that you want to download. You can find it in the URL (X-es):"
-             " `" + SAFARI_BASE_URL + "/library/view/book-name/XXXXXXXXXXXXX/`"
-    )
-
-    args_parsed = arguments.parse_args()
-    if args_parsed.cred or args_parsed.login:
-        user_email = ""
-        pre_cred = ""
-
-        if args_parsed.cred:
-            pre_cred = args_parsed.cred
-
-        else:
-            user_email = input("Email: ")
-            passwd = getpass.getpass("Password: ")
-            pre_cred = user_email + ":" + passwd
-
-        parsed_cred = SafariBooks.parse_cred(pre_cred)
-
-        if not parsed_cred:
-            arguments.error("invalid credential: %s" % (
-                args_parsed.cred if args_parsed.cred else (user_email + ":*******")
-            ))
-
-        args_parsed.cred = parsed_cred
-
-    else:
-        if args_parsed.no_cookies:
-            arguments.error("invalid option: `--no-cookies` is valid only if you use the `--cred` option")
-
+def lambda_handler(event, context):
+    args_parsed = {}
+    args_parsed["cred"] = SafariBooks.parse_cred(os.environ["Credential"])
+    args_parsed["login"] = True
+    args_parsed["no_cookies"] = True
+    args_parsed["kindle"] = True
+    args_parsed["log"] = True
+    args_parsed["bookid"] = event["BookId"]
+    args_parsed["s3_bucket"] = os.environ["S3Bucket"]
     SafariBooks(args_parsed)
-    # Hint: do you want to download more then one book once, initialized more than one instance of `SafariBooks`...
-    sys.exit(0)
